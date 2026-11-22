@@ -9,7 +9,7 @@
 //! the local private key define the tunnel, and the two configured tunnel IP
 //! addresses route TCP traffic over it.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -19,7 +19,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::task::{Context as TaskContext, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use boringtun::noise::{Tunn, TunnResult};
+use boringtun::noise::handshake::parse_handshake_anon;
+use boringtun::noise::rate_limiter::RateLimiter;
+use boringtun::noise::{Packet, Tunn, TunnResult};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium, PacketMeta};
 use smoltcp::socket::{Socket, tcp};
@@ -32,62 +34,59 @@ use tokio::task::JoinHandle;
 
 pub use boringtun::x25519::{PublicKey, StaticSecret};
 pub use smoltcp::socket::tcp::State as TcpState;
+pub use smoltcp::wire::IpCidr as AllowedIp;
 
-pub type PeerVerifierFuture = Pin<Box<dyn Future<Output = bool> + Send + 'static>>;
+pub type PeerVerifierFuture =
+    Pin<Box<dyn Future<Output = Option<Vec<AllowedIp>>> + Send + 'static>>;
 pub type PeerVerifier = Box<dyn Fn(PublicKey) -> PeerVerifierFuture + Send + Sync + 'static>;
 
 const MTU: usize = 1420;
 const TCP_BUFFER_SIZE: usize = 64 * 1024;
 const MAX_UDP_DATAGRAM: usize = 65_535;
 const DRIVER_SLICE: Duration = Duration::from_secs(1);
+const LISTENER_BACKLOG: usize = 32;
 
-/// Configuration for one point-to-point WireGuard context.
+#[derive(Clone, Copy)]
+pub struct KnownPeer {
+    pub public_key: PublicKey,
+    pub endpoint: SocketAddr,
+}
+
+/// Configuration for a WireGuard context and its shared TCP/IP stack.
 pub struct ContextConfig {
     /// The local WireGuard private key.
     pub local_private_key: StaticSecret,
-    /// The remote peer's WireGuard public key.
-    pub peer_public_key: PublicKey,
     /// This endpoint's address inside the WireGuard tunnel.
     pub local_ip: IpAddr,
-    /// The remote endpoint's address inside the WireGuard tunnel.
-    pub peer_ip: IpAddr,
     /// UDP address on which to receive WireGuard packets.
     pub udp_bind: SocketAddr,
-    /// Optional initial UDP endpoint for the remote WireGuard peer.
-    ///
-    /// Clients normally set this. Servers can leave it unset and learn the
-    /// endpoint from the first valid WireGuard packet.
-    pub peer_addr: Option<SocketAddr>,
-    /// Async authorization hook for the configured peer public key.
+    /// Peers that can be dialled before they have initiated a handshake.
+    pub known_peers: Vec<KnownPeer>,
+    /// Async authorization and allowed-address lookup for peer public keys.
     pub peer_verifier: Option<PeerVerifier>,
-    /// Forget the active WireGuard peer after this much peer inactivity.
+    /// Forget peers after this much authenticated inactivity.
     pub peer_idle_timeout: Option<Duration>,
 }
 
 impl ContextConfig {
-    pub fn new(
-        local_private_key: StaticSecret,
-        peer_public_key: PublicKey,
-        local_ip: IpAddr,
-        peer_ip: IpAddr,
-        udp_bind: SocketAddr,
-    ) -> Self {
+    pub fn new(local_private_key: StaticSecret, local_ip: IpAddr, udp_bind: SocketAddr) -> Self {
         Self {
             local_private_key,
-            peer_public_key,
             local_ip,
-            peer_ip,
             udp_bind,
-            peer_addr: None,
+            known_peers: Vec::new(),
             peer_verifier: None,
             peer_idle_timeout: None,
         }
     }
 
-    /// Set the peer's initial UDP endpoint.
+    /// Add a peer that this context can dial before receiving its handshake.
     #[must_use]
-    pub fn with_peer_addr(mut self, peer_addr: SocketAddr) -> Self {
-        self.peer_addr = Some(peer_addr);
+    pub fn with_peer(mut self, public_key: PublicKey, endpoint: SocketAddr) -> Self {
+        self.known_peers.push(KnownPeer {
+            public_key,
+            endpoint,
+        });
         self
     }
 
@@ -99,7 +98,7 @@ impl ContextConfig {
     pub fn with_peer_verifier<F, Fut>(mut self, verifier: F) -> Self
     where
         F: Fn(PublicKey) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = bool> + Send + 'static,
+        Fut: Future<Output = Option<Vec<AllowedIp>>> + Send + 'static,
     {
         self.peer_verifier = Some(Box::new(move |key| {
             Box::pin(verifier(key)) as PeerVerifierFuture
@@ -107,7 +106,7 @@ impl ContextConfig {
         self
     }
 
-    /// Forget the active peer after a period without authenticated peer traffic.
+    /// Forget peers after a period without authenticated peer traffic.
     #[must_use]
     pub fn with_peer_idle_timeout(mut self, peer_idle_timeout: Duration) -> Self {
         self.peer_idle_timeout = Some(peer_idle_timeout);
@@ -133,18 +132,33 @@ impl Drop for Driver {
 
 struct Inner {
     stack: Mutex<Stack>,
+    peer_routes: Mutex<Vec<PeerRoute>>,
     wakers: Mutex<Vec<Waker>>,
     driver_notify: Notify,
     state_notify: Notify,
     transport_busy: AtomicBool,
     finalised: AtomicBool,
-    last_activity: Mutex<Instant>,
     peer_idle_timeout: Option<Duration>,
     udp_addr: SocketAddr,
     local_ip: IpAddr,
-    peer_ip: IpAddr,
-    peer_public_key: PublicKey,
 }
+
+#[derive(Clone)]
+struct PeerRoute {
+    peer_public_key: PublicKey,
+    allowed: Vec<AllowedIp>,
+}
+
+struct PeerState {
+    public_key: PublicKey,
+    endpoint: SocketAddr,
+    allowed: Vec<AllowedIp>,
+    tunn: Tunn,
+    last_activity: Instant,
+    index: u32,
+}
+
+type AcceptedConnection = (usize, SocketHandle, SocketHandle, SocketAddr, SocketAddr);
 
 struct Stack {
     iface: Interface,
@@ -157,53 +171,86 @@ struct Stack {
 impl Context {
     /// Create and start a WireGuard context.
     pub async fn new(config: ContextConfig) -> io::Result<Self> {
-        if config.local_ip.is_ipv4() != config.peer_ip.is_ipv4() {
+        if config.known_peers.is_empty() && config.peer_verifier.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "local_ip and peer_ip must use the same address family",
-            ));
-        }
-        if let Some(verifier) = &config.peer_verifier
-            && !verifier(config.peer_public_key).await
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "WireGuard peer rejected by async verifier",
+                "a peer verifier is required for inbound WireGuard peers",
             ));
         }
 
         let udp = UdpSocket::bind(config.udp_bind).await?;
         let udp_addr = udp.local_addr()?;
-        let mut stack = Stack::new(config.local_ip, config.peer_ip);
+        let local_public = PublicKey::from(&config.local_private_key);
+        let rate_limiter = Arc::new(RateLimiter::new(&local_public, 100));
+        let mut peers = HashMap::new();
+        let mut routes = Vec::new();
+
+        for (offset, known) in config.known_peers.iter().enumerate() {
+            let allowed = match &config.peer_verifier {
+                Some(verifier) => verifier(known.public_key).await,
+                None => None,
+            }
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "WireGuard peer rejected by async verifier",
+                )
+            })?;
+            let index = (offset as u32) + 1;
+            let tunn = Tunn::new(
+                config.local_private_key.clone(),
+                known.public_key,
+                None,
+                None,
+                index,
+                Some(Arc::clone(&rate_limiter)),
+            );
+            peers.insert(
+                known.public_key,
+                PeerState {
+                    public_key: known.public_key,
+                    endpoint: known.endpoint,
+                    allowed: allowed.clone(),
+                    tunn,
+                    last_activity: Instant::now(),
+                    index,
+                },
+            );
+            routes.push(PeerRoute {
+                peer_public_key: known.public_key,
+                allowed,
+            });
+        }
+
+        let mut stack = Stack::new(config.local_ip);
         stack.poll_interface();
 
         let inner = Arc::new(Inner {
             stack: Mutex::new(stack),
+            peer_routes: Mutex::new(routes),
             wakers: Mutex::new(Vec::new()),
             driver_notify: Notify::new(),
             state_notify: Notify::new(),
             transport_busy: AtomicBool::new(false),
             finalised: AtomicBool::new(false),
-            last_activity: Mutex::new(Instant::now()),
             peer_idle_timeout: config.peer_idle_timeout,
             udp_addr,
             local_ip: config.local_ip,
-            peer_ip: config.peer_ip,
-            peer_public_key: config.peer_public_key,
         });
-
-        let tunn = Tunn::new(
-            config.local_private_key,
-            config.peer_public_key,
-            None,
-            None,
-            0,
-            None,
-        );
 
         let task_inner = Arc::clone(&inner);
         let task = tokio::spawn(async move {
-            run_driver(task_inner, udp, tunn, config.peer_addr).await;
+            run_driver(
+                task_inner,
+                udp,
+                config.local_private_key,
+                local_public,
+                config.peer_verifier,
+                rate_limiter,
+                peers,
+                (config.known_peers.len() as u32) + 1,
+            )
+            .await;
         });
 
         Ok(Self {
@@ -217,11 +264,6 @@ impl Context {
         Ok(self.inner.udp_addr)
     }
 
-    /// The authorized remote WireGuard public key for this context.
-    pub fn peer_public_key(&self) -> PublicKey {
-        self.inner.peer_public_key
-    }
-
     /// Open a TCP connection to `remote` through the tunnel.
     ///
     /// This waits for the TCP handshake and returns an object implementing
@@ -231,15 +273,12 @@ impl Context {
             return Err(io::Error::from(io::ErrorKind::ConnectionAborted));
         }
         let remote = remote.into();
-        if remote.ip() != self.inner.peer_ip {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "remote IP must be the context peer IP {}, got {}",
-                    self.inner.peer_ip, remote
-                ),
-            ));
-        }
+        let peer_public_key = self.inner.peer_for_ip(remote.ip()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                format!("no WireGuard peer permits {remote}"),
+            )
+        })?;
 
         let handle = self.inner.start_connect(remote)?;
         self.inner.request_driver();
@@ -256,6 +295,7 @@ impl Context {
                         handle: Mutex::new(handle),
                         nodelay: AtomicBool::new(false),
                         _driver: Arc::clone(&self._driver),
+                        peer_public_key,
                     });
                 }
                 tcp::State::Closed => {
@@ -292,21 +332,28 @@ impl Context {
         }
 
         let mut stack = lock(&self.inner.stack);
-        let handle = stack.add_socket();
-        if let Err(err) = stack.socket_mut(handle).listen(addr.port()) {
-            stack.remove(handle);
-            return Err(io::Error::new(
-                io::ErrorKind::AddrInUse,
-                format!("cannot listen on {addr}: {err:?}"),
-            ));
+        let mut handles = Vec::with_capacity(LISTENER_BACKLOG);
+        for _ in 0..LISTENER_BACKLOG {
+            let handle = stack.add_socket();
+            if let Err(err) = stack.socket_mut(handle).listen(addr.port()) {
+                stack.remove(handle);
+                for handle in handles {
+                    stack.remove(handle);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!("cannot listen on {addr}: {err:?}"),
+                ));
+            }
+            handles.push(handle);
         }
-        stack.listeners.push(handle);
+        stack.listeners.extend(&handles);
         drop(stack);
 
         self.inner.request_driver();
         Ok(TcpListener {
             inner: Arc::clone(&self.inner),
-            handle: Mutex::new(handle),
+            handles: Mutex::new(handles),
             local_addr: addr,
             _driver: Arc::clone(&self._driver),
         })
@@ -393,27 +440,46 @@ impl Inner {
         }
     }
 
-    fn touch(&self) {
-        *lock(&self.last_activity) = Instant::now();
+    fn peer_for_ip(&self, ip: IpAddr) -> Option<PublicKey> {
+        lock(&self.peer_routes)
+            .iter()
+            .find(|route| {
+                route
+                    .allowed
+                    .iter()
+                    .any(|allowed| allowed.contains_addr(&IpAddress::from(ip)))
+            })
+            .map(|route| route.peer_public_key)
     }
 
-    fn peer_timeout_delay(&self, driver_delay: Duration) -> Duration {
-        let Some(timeout) = self.peer_idle_timeout else {
-            return driver_delay;
-        };
-        let remaining = timeout.saturating_sub(lock(&self.last_activity).elapsed());
-        driver_delay.min(remaining.max(Duration::from_millis(1)))
+    fn set_peer_routes(&self, peer_public_key: PublicKey, allowed: Vec<AllowedIp>) {
+        let mut routes = lock(&self.peer_routes);
+        routes.retain(|route| route.peer_public_key != peer_public_key);
+        routes.push(PeerRoute {
+            peer_public_key,
+            allowed,
+        });
     }
 
-    fn peer_timed_out(&self) -> bool {
-        self.peer_idle_timeout
-            .is_some_and(|timeout| lock(&self.last_activity).elapsed() >= timeout)
+    fn remove_peer_routes(&self, peer_public_key: PublicKey) {
+        lock(&self.peer_routes).retain(|route| route.peer_public_key != peer_public_key);
     }
 
-    fn forget_peer(&self) {
+    fn forget_peer(&self, peer_public_key: PublicKey, allowed: &[AllowedIp]) {
+        self.remove_peer_routes(peer_public_key);
         let mut stack = lock(&self.stack);
         let listeners = stack.listeners.clone();
-        let handles: Vec<_> = stack.sockets.iter().map(|(handle, _)| handle).collect();
+        let handles: Vec<_> = stack
+            .sockets
+            .iter()
+            .filter_map(|(handle, socket)| match socket {
+                Socket::Tcp(socket) => socket
+                    .remote_endpoint()
+                    .map(|endpoint| IpAddress::from(IpAddr::from(endpoint.addr)))
+                    .filter(|remote| allowed.iter().any(|allowed| allowed.contains_addr(remote)))
+                    .map(|_| handle),
+            })
+            .collect();
 
         for handle in handles {
             if !listeners.contains(&handle) {
@@ -487,7 +553,7 @@ impl Inner {
 }
 
 impl Stack {
-    fn new(local_ip: IpAddr, peer_ip: IpAddr) -> Self {
+    fn new(local_ip: IpAddr) -> Self {
         let mut device = QueueDevice::default();
         let mut config = Config::new(HardwareAddress::Ip);
         config.random_seed = random_seed();
@@ -500,17 +566,17 @@ impl Stack {
                 .expect("one interface address always fits");
         });
 
-        match peer_ip {
-            IpAddr::V4(peer) => {
+        match local_ip {
+            IpAddr::V4(local) => {
                 iface
                     .routes_mut()
-                    .add_default_ipv4_route(peer)
+                    .add_default_ipv4_route(local)
                     .expect("default IPv4 route fits");
             }
-            IpAddr::V6(peer) => {
+            IpAddr::V6(local) => {
                 iface
                     .routes_mut()
-                    .add_default_ipv6_route(peer)
+                    .add_default_ipv6_route(local)
                     .expect("default IPv6 route fits");
             }
         }
@@ -626,6 +692,15 @@ impl Stack {
         }
         Ok(Some((replacement_handle, accepted_handle, local, remote)))
     }
+
+    fn accept_any(&mut self, listeners: &[SocketHandle]) -> io::Result<Option<AcceptedConnection>> {
+        for (position, listener) in listeners.iter().enumerate() {
+            if let Some((replacement, accepted, local, remote)) = self.accept(*listener)? {
+                return Ok(Some((position, replacement, accepted, local, remote)));
+            }
+        }
+        Ok(None)
+    }
 }
 
 #[derive(Default)]
@@ -708,6 +783,7 @@ pub struct TcpStream {
     inner: Arc<Inner>,
     handle: Mutex<SocketHandle>,
     nodelay: AtomicBool,
+    peer_public_key: PublicKey,
     _driver: Arc<Driver>,
 }
 
@@ -819,7 +895,7 @@ impl TcpStream {
 
     /// The authorized WireGuard identity of the remote peer.
     pub fn peer_public_key(&self) -> PublicKey {
-        self.inner.peer_public_key
+        self.peer_public_key
     }
 
     /// Wait until a graceful close has flushed its final ACK.
@@ -1016,7 +1092,7 @@ impl AsyncWrite for TcpStream {
 /// A listener for TCP connections over a WireGuard context.
 pub struct TcpListener {
     inner: Arc<Inner>,
-    handle: Mutex<SocketHandle>,
+    handles: Mutex<Vec<SocketHandle>>,
     local_addr: SocketAddr,
     _driver: Arc<Driver>,
 }
@@ -1024,11 +1100,6 @@ pub struct TcpListener {
 impl TcpListener {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         Ok(self.local_addr)
-    }
-
-    /// The authorized WireGuard identity of the expected remote peer.
-    pub fn peer_public_key(&self) -> PublicKey {
-        self.inner.peer_public_key
     }
 
     pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
@@ -1040,11 +1111,11 @@ impl TcpListener {
             tokio::pin!(notified);
             notified.as_mut().enable();
             let accepted = {
-                let mut handle = lock(&self.handle);
+                let mut handles = lock(&self.handles);
                 let mut stack = lock(&self.inner.stack);
-                match stack.accept(*handle) {
-                    Ok(Some((replacement, accepted, _local, remote))) => {
-                        *handle = replacement;
+                match stack.accept_any(&handles) {
+                    Ok(Some((position, replacement, accepted, _local, remote))) => {
+                        handles[position] = replacement;
                         Some((accepted, remote))
                     }
                     Ok(None) => None,
@@ -1053,6 +1124,12 @@ impl TcpListener {
             };
 
             if let Some((accepted_handle, remote)) = accepted {
+                let peer_public_key = self.inner.peer_for_ip(remote.ip()).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        format!("no authorized WireGuard peer owns {}", remote.ip()),
+                    )
+                })?;
                 self.inner.request_driver();
                 return Ok((
                     TcpStream {
@@ -1060,6 +1137,7 @@ impl TcpListener {
                         handle: Mutex::new(accepted_handle),
                         nodelay: AtomicBool::new(false),
                         _driver: Arc::clone(&self._driver),
+                        peer_public_key,
                     },
                     remote,
                 ));
@@ -1072,32 +1150,44 @@ impl TcpListener {
 
 impl Drop for TcpListener {
     fn drop(&mut self) {
-        let handle = self.handle.get_mut().unwrap_or_else(|err| err.into_inner());
+        let handles = self
+            .handles
+            .get_mut()
+            .unwrap_or_else(|err| err.into_inner());
         let mut stack = lock(&self.inner.stack);
-        stack.listeners.retain(|listener| listener != handle);
-        stack.socket_mut(*handle).abort();
-        stack.remove(*handle);
+        for handle in handles.iter() {
+            stack.listeners.retain(|listener| listener != handle);
+            stack.socket_mut(*handle).abort();
+            stack.remove(*handle);
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_driver(
     inner: Arc<Inner>,
     udp: UdpSocket,
-    mut tunn: Tunn,
-    mut peer_addr: Option<SocketAddr>,
+    local_private: StaticSecret,
+    local_public: PublicKey,
+    verifier: Option<PeerVerifier>,
+    rate_limiter: Arc<RateLimiter>,
+    mut peers: HashMap<PublicKey, PeerState>,
+    mut next_index: u32,
 ) {
     let mut udp_buffer = vec![0; MAX_UDP_DATAGRAM];
-    let mut tunnel_buffer = vec![0; MTU + 256];
+    let mut tunnel_buffer = vec![0; MAX_UDP_DATAGRAM];
+    let mut cookie_buffer = [0u8; 64];
 
     loop {
-        let delay = inner.next_delay();
-        let delay = if peer_addr.is_some() {
-            inner.peer_timeout_delay(delay)
-        } else {
-            delay
-        };
+        let mut delay = inner.next_delay();
+        if let Some(timeout) = inner.peer_idle_timeout {
+            for peer in peers.values() {
+                let remaining = timeout.saturating_sub(peer.last_activity.elapsed());
+                delay = delay.min(remaining.max(Duration::from_millis(1)));
+            }
+        }
         let notified = inner.driver_notify.notified();
-        let mut outbound = Vec::new();
+        let mut outbound: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
         let mut inbound = Vec::new();
 
         tokio::select! {
@@ -1105,17 +1195,85 @@ async fn run_driver(
             _ = tokio::time::sleep(delay) => {}
             result = udp.recv_from(&mut udp_buffer) => {
                 if let Ok((len, source)) = result {
-                    let authenticated = decapsulate(
-                        &mut tunn,
-                        source.ip(),
-                        &udp_buffer[..len],
-                        &mut tunnel_buffer,
-                        &mut inbound,
-                        &mut outbound,
-                    );
-                    if authenticated {
-                        peer_addr = Some(source);
-                        inner.touch();
+                    let datagram = &udp_buffer[..len];
+                    let parsed = match rate_limiter.verify_packet(
+                        Some(source.ip()),
+                        datagram,
+                        &mut cookie_buffer,
+                    ) {
+                        Ok(packet) => Some(packet),
+                        Err(TunnResult::WriteToNetwork(cookie)) => {
+                            outbound.push((source, cookie.to_vec()));
+                            None
+                        }
+                        Err(_) => None,
+                    };
+
+                    let target = parsed.as_ref().and_then(|packet| match packet {
+                        Packet::HandshakeInit(init) => parse_handshake_anon(
+                            &local_private,
+                            &local_public,
+                            init,
+                        )
+                        .ok()
+                        .map(|handshake| PublicKey::from(handshake.peer_static_public)),
+                        Packet::HandshakeResponse(packet) => {
+                            peer_key_by_index(&peers, packet.receiver_idx)
+                        }
+                        Packet::PacketCookieReply(packet) => {
+                            peer_key_by_index(&peers, packet.receiver_idx)
+                        }
+                        Packet::PacketData(packet) => {
+                            peer_key_by_index(&peers, packet.receiver_idx)
+                        }
+                    });
+
+                    if let Some(peer_key) = target {
+                        let is_handshake_init =
+                            matches!(parsed.as_ref(), Some(Packet::HandshakeInit(_)));
+                        let allowed = if is_handshake_init {
+                            match &verifier {
+                                Some(verifier) => verifier(peer_key).await,
+                                None => peers.get(&peer_key).map(|peer| peer.allowed.clone()),
+                            }
+                        } else {
+                            peers.get(&peer_key).map(|peer| peer.allowed.clone())
+                        };
+
+                        if let Some(allowed) = allowed {
+                            let peer = peers.entry(peer_key).or_insert_with(|| {
+                                let index = next_index;
+                                next_index += 1;
+                                let tunn = Tunn::new(
+                                    local_private.clone(),
+                                    peer_key,
+                                    None,
+                                    None,
+                                    index,
+                                    Some(Arc::clone(&rate_limiter)),
+                                );
+                                PeerState {
+                                    public_key: peer_key,
+                                    endpoint: source,
+                                    allowed: allowed.clone(),
+                                    tunn,
+                                    last_activity: Instant::now(),
+                                    index,
+                                }
+                            });
+                            peer.endpoint = source;
+                            peer.allowed = allowed.clone();
+                            peer.last_activity = Instant::now();
+                            inner.set_peer_routes(peer_key, allowed);
+                            decapsulate_peer(
+                                peer,
+                                source.ip(),
+                                datagram,
+                                &mut tunnel_buffer,
+                                &mut inbound,
+                                &mut outbound,
+                            );
+                        }
                     }
                 }
             }
@@ -1124,9 +1282,17 @@ async fn run_driver(
         if inner.finalised.load(Ordering::Acquire) {
             break;
         }
-        if peer_addr.is_some() && inner.peer_timed_out() {
-            peer_addr = None;
-            inner.forget_peer();
+
+        if let Some(timeout) = inner.peer_idle_timeout {
+            let expired: Vec<_> = peers
+                .iter()
+                .filter(|(_, peer)| peer.last_activity.elapsed() >= timeout)
+                .map(|(key, peer)| (*key, peer.allowed.clone()))
+                .collect();
+            for (key, allowed) in expired {
+                peers.remove(&key);
+                inner.forget_peer(key, &allowed);
+            }
         }
 
         inner.transport_busy.store(true, Ordering::Release);
@@ -1136,7 +1302,9 @@ async fn run_driver(
             stack.device.rx.extend(inbound.drain(..));
         }
 
-        update_timers(&mut tunn, &mut tunnel_buffer, &mut inbound, &mut outbound);
+        for peer in peers.values_mut() {
+            update_peer_timers(peer, &mut tunnel_buffer, &mut inbound, &mut outbound);
+        }
 
         if !inbound.is_empty() {
             let mut stack = lock(&inner.stack);
@@ -1145,13 +1313,21 @@ async fn run_driver(
 
         let packets = inner.poll_stack();
         for packet in packets {
-            encapsulate(
-                &mut tunn,
-                &packet,
-                &mut tunnel_buffer,
-                &mut inbound,
-                &mut outbound,
-            );
+            let Some(destination) = Tunn::dst_address(&packet) else {
+                continue;
+            };
+            let Some(peer_key) = inner.peer_for_ip(destination) else {
+                continue;
+            };
+            if let Some(peer) = peers.get_mut(&peer_key) {
+                encapsulate_peer(
+                    peer,
+                    &packet,
+                    &mut tunnel_buffer,
+                    &mut inbound,
+                    &mut outbound,
+                );
+            }
         }
 
         if !inbound.is_empty() {
@@ -1160,7 +1336,9 @@ async fn run_driver(
             stack.poll_interface();
         }
 
-        send_datagrams(&udp, peer_addr, outbound).await;
+        for (destination, packet) in outbound {
+            let _ = udp.send_to(&packet, destination).await;
+        }
 
         // Encryption may reveal newly queued packets or make a TCP socket
         // readable/writable, so give API waiters another poll.
@@ -1169,74 +1347,97 @@ async fn run_driver(
     }
 }
 
-async fn send_datagrams(udp: &UdpSocket, peer_addr: Option<SocketAddr>, packets: Vec<Vec<u8>>) {
-    let Some(peer_addr) = peer_addr else {
-        return;
-    };
-    for packet in packets {
-        let _ = udp.send_to(&packet, peer_addr).await;
-    }
+fn peer_key_by_index(
+    peers: &HashMap<PublicKey, PeerState>,
+    receiver_idx: u32,
+) -> Option<PublicKey> {
+    let index = receiver_idx >> 8;
+    peers
+        .values()
+        .find(|peer| peer.index == index)
+        .map(|peer| peer.public_key)
 }
 
-fn update_timers(
-    tunn: &mut Tunn,
+fn update_peer_timers(
+    peer: &mut PeerState,
     buffer: &mut [u8],
     inbound: &mut Vec<Vec<u8>>,
-    outbound: &mut Vec<Vec<u8>>,
+    outbound: &mut Vec<(SocketAddr, Vec<u8>)>,
 ) {
-    match tunn.update_timers(buffer) {
-        TunnResult::WriteToNetwork(packet) => outbound.push(packet.to_vec()),
-        TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
-            inbound.push(packet.to_vec())
-        }
-        TunnResult::Done | TunnResult::Err(_) => {}
-    }
+    let result = peer.tunn.update_timers(buffer);
+    handle_tunn_result(peer, result, inbound, outbound);
 }
 
-fn encapsulate(
-    tunn: &mut Tunn,
+fn encapsulate_peer(
+    peer: &mut PeerState,
     packet: &[u8],
     buffer: &mut [u8],
     inbound: &mut Vec<Vec<u8>>,
-    outbound: &mut Vec<Vec<u8>>,
+    outbound: &mut Vec<(SocketAddr, Vec<u8>)>,
 ) {
-    match tunn.encapsulate(packet, buffer) {
-        TunnResult::WriteToNetwork(packet) => outbound.push(packet.to_vec()),
-        TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
-            inbound.push(packet.to_vec())
-        }
-        TunnResult::Done | TunnResult::Err(_) => {}
-    }
+    let result = peer.tunn.encapsulate(packet, buffer);
+    handle_tunn_result(peer, result, inbound, outbound);
 }
 
-fn decapsulate(
-    tunn: &mut Tunn,
+fn decapsulate_peer(
+    peer: &mut PeerState,
     source: IpAddr,
     datagram: &[u8],
     buffer: &mut [u8],
     inbound: &mut Vec<Vec<u8>>,
-    outbound: &mut Vec<Vec<u8>>,
+    outbound: &mut Vec<(SocketAddr, Vec<u8>)>,
 ) -> bool {
     let mut authenticated = false;
     let mut pending = Some(datagram);
 
     while let Some(datagram) = pending.take() {
-        match tunn.decapsulate(Some(source), datagram, buffer) {
-            TunnResult::WriteToNetwork(packet) => {
-                authenticated = true;
-                outbound.push(packet.to_vec());
-                pending = Some(&[]);
-            }
-            TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
-                authenticated = true;
-                inbound.push(packet.to_vec());
-                pending = Some(&[]);
-            }
-            TunnResult::Done => break,
-            TunnResult::Err(_) => break,
+        let result = peer.tunn.decapsulate(Some(source), datagram, buffer);
+        if matches!(
+            &result,
+            TunnResult::WriteToNetwork(_)
+                | TunnResult::WriteToTunnelV4(_, _)
+                | TunnResult::WriteToTunnelV6(_, _)
+        ) {
+            authenticated = true;
+            handle_tunn_result(peer, result, inbound, outbound);
+            pending = Some(&[]);
+        } else {
+            break;
         }
     }
     authenticated
+}
+
+fn handle_tunn_result(
+    peer: &PeerState,
+    result: TunnResult<'_>,
+    inbound: &mut Vec<Vec<u8>>,
+    outbound: &mut Vec<(SocketAddr, Vec<u8>)>,
+) {
+    match result {
+        TunnResult::WriteToNetwork(packet) => {
+            outbound.push((peer.endpoint, packet.to_vec()));
+        }
+        TunnResult::WriteToTunnelV4(packet, source) => {
+            if peer
+                .allowed
+                .iter()
+                .any(|allowed| allowed.contains_addr(&IpAddress::from(source)))
+            {
+                inbound.push(packet.to_vec());
+            }
+        }
+        TunnResult::WriteToTunnelV6(packet, source) => {
+            if peer
+                .allowed
+                .iter()
+                .any(|allowed| allowed.contains_addr(&IpAddress::from(source)))
+            {
+                inbound.push(packet.to_vec());
+            }
+        }
+        TunnResult::Done | TunnResult::Err(_) => {}
+    }
 }
 
 fn readiness_matches(ready: Ready, interest: Interest) -> bool {

@@ -1,24 +1,31 @@
 # wg-tokio
 
-A small, point-to-point `tokio::net`-style TCP API over
-[BoringTun](https://github.com/cloudflare/boringtun) and
-[smoltcp](https://github.com/smoltcp-rs/smoltcp).
+A small `tokio::net`-style TCP API over [BoringTun](https://github.com/cloudflare/boringtun)
+and [smoltcp](https://github.com/smoltcp-rs/smoltcp).
 
-Each [`Context`](src/lib.rs) uses one local private key and one remote public
-key. Its TCP streams and listener implement tokio's `AsyncRead`/`AsyncWrite`
-traits, so they can be handed to hyper or another async socket consumer.
+A `Context` owns one UDP socket, one WireGuard identity, one smoltcp TCP/IP
+stack, and any number of WireGuard peers. A single `TcpListener` accepts
+connections from all peers. Streams implement tokio's `AsyncRead` and
+`AsyncWrite`, so they can be used by hyper or another async socket consumer.
+
+## Client
 
 ```rust,no_run
-use wg_tokio::{Context, ContextConfig};
+use wg_tokio::{AllowedIp, Context, ContextConfig, PublicKey, StaticSecret};
 
-# async fn example(private: wg_tokio::StaticSecret, public: wg_tokio::PublicKey) -> std::io::Result<()> {
-let context = Context::new(ContextConfig::new(
-    private,
-    public,
-    "10.7.0.2".parse().unwrap(),
-    "10.7.0.1".parse().unwrap(),
-    "0.0.0.0:51820".parse().unwrap(),
-).with_peer_addr("198.51.100.10:51820".parse().unwrap())).await?;
+# async fn example(private: StaticSecret, public: PublicKey) -> std::io::Result<()> {
+let context = Context::new(
+    ContextConfig::new(
+        private,
+        "10.7.0.2".parse().unwrap(),
+        "0.0.0.0:51820".parse().unwrap(),
+    )
+    .with_peer(public, "198.51.100.10:51820".parse().unwrap())
+    .with_peer_verifier(move |key| async move {
+        (key == public).then(|| vec!["10.7.0.1/32".parse::<AllowedIp>().unwrap()])
+    }),
+)
+.await?;
 
 let mut socket = context.connect(("10.7.0.1", 8080)).await?;
 assert_eq!(socket.peer_public_key(), public);
@@ -27,37 +34,52 @@ context.finalise().await?;
 # }
 ```
 
-Clients normally set `with_peer_addr(...)`. A server can omit it and learns the
-peer's UDP endpoint from the first valid WireGuard packet.
+## Server
 
-Call `Context::finalise().await` to close and drain all sockets before dropping
-a client context. The server example sets
-`with_peer_idle_timeout(Duration::from_secs(5))`; after five seconds without
-authenticated traffic it forgets the peer endpoint and closes that peer's active
-streams while its listener and context remain alive. Dropping an unfinalised
-context panics.
-
-An async peer verifier can authorize either side of a context before it is
-created:
+The verifier identifies new WireGuard peers from BoringTun's anonymous
+handshake parser. It can perform async work and returns `Some(allowed_cidrs)` to
+admit the peer or `None` to reject it.
 
 ```rust,no_run
-# use wg_tokio::{ContextConfig, PeerVerifierFuture, PublicKey, StaticSecret};
-# fn example(private: StaticSecret, public: PublicKey) {
-# fn verifier(_: wg_tokio::PublicKey) -> PeerVerifierFuture {
-#     Box::pin(async { true })
-# }
-let config = ContextConfig::new(
-    private,
-    public,
-    "10.7.0.2".parse().unwrap(),
-    "10.7.0.1".parse().unwrap(),
-    "0.0.0.0:51820".parse().unwrap(),
+# use wg_tokio::{AllowedIp, Context, ContextConfig, PublicKey, StaticSecret};
+# async fn example(private: StaticSecret, client_public: PublicKey) -> std::io::Result<()> {
+let context = Context::new(
+    ContextConfig::new(
+        private,
+        "10.7.0.1".parse().unwrap(),
+        "0.0.0.0:51820".parse().unwrap(),
+    )
+    .with_peer_verifier(move |key| async move {
+        if key == client_public {
+            Some(vec!["10.7.0.2/32".parse::<AllowedIp>().unwrap()])
+        } else {
+            None
+        }
+    }),
 )
-.with_peer_verifier(verifier);
+.await?;
+
+let listener = context.listen(("10.7.0.1", 8080)).await?;
+# let _ = listener;
+# Ok(())
 # }
 ```
 
-Run the examples in separate terminals:
+Authorized address ranges must not overlap between peers. The listener can
+accept concurrent connections from peers with distinct tunnel addresses while
+sharing one smoltcp TCP/IP stack.
+
+## Lifecycle
+
+Call `Context::finalise().await` to close and drain all sockets before dropping
+a context. The server example uses
+`with_peer_idle_timeout(Duration::from_secs(5))`; inactive peers are forgotten
+without stopping the listener or Context. Dropping an unfinalised context
+panics.
+
+## Examples
+
+Run in separate terminals:
 
 ```text
 cargo run --example server
@@ -66,6 +88,5 @@ cargo run --example client
 
 Set `WG_PORT` on both commands to use a UDP port other than `51820`.
 
-The examples use fixed keys and loopback UDP addresses so they can be run
-directly. Fixed keys are for demonstration only; generate and protect real
-WireGuard keys in actual applications.
+The examples use fixed keys and loopback UDP addresses. Fixed keys are for
+demonstration only; generate and protect real WireGuard keys in applications.

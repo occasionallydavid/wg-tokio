@@ -1,7 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use wg_tokio::{Context, ContextConfig, PublicKey, StaticSecret};
+use wg_tokio::{AllowedIp, Context, ContextConfig, PublicKey, StaticSecret};
 
 const CLIENT_PRIVATE: [u8; 32] = [1; 32];
 const SERVER_PRIVATE: [u8; 32] = [2; 32];
@@ -17,14 +17,16 @@ async fn main() -> std::io::Result<()> {
         .unwrap_or(51820);
     let server_udp = SocketAddr::from(([127, 0, 0, 1], udp_port));
     let server_public = PublicKey::from(&StaticSecret::from(SERVER_PRIVATE));
+    let server_cidr: AllowedIp = "10.7.0.1/32".parse().unwrap();
     let config = ContextConfig::new(
         StaticSecret::from(CLIENT_PRIVATE),
-        server_public,
         local_ip,
-        peer_ip,
         SocketAddr::from(([127, 0, 0, 1], 0)),
     )
-    .with_peer_addr(server_udp);
+    .with_peer(server_public, server_udp)
+    .with_peer_verifier(
+        move |key| async move { (key == server_public).then(|| vec![server_cidr]) },
+    );
 
     let context = Context::new(config).await?;
     let exchange = run_exchange(&context, peer_ip).await;
