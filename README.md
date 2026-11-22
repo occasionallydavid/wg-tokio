@@ -3,6 +3,21 @@
 A small `tokio::net`-style TCP API over [BoringTun](https://github.com/cloudflare/boringtun)
 and [smoltcp](https://github.com/smoltcp-rs/smoltcp).
 
+The purpose of this is to give some middleground that is:
+
+* Compatible - can connect to an endpoint with a standard Wireguard and TCP/IP client
+* Compact - does not pull in megabytes of code to get secure communication
+* Simplistic - manage a bunch of public keys rather than PKI certs (like Quic)
+* Relatively efficient - HTTP over Wireguard is more round-trip heavy than
+  Quic, but trades ideal networking for much smaller dependencies. For example
+  there is no need to link Rustls or OpenSSL
+* Easy to use - lives entirely in userspace
+* Extensible - can be swapped out for a real Wireguard+HTTP setup with no
+  protocol changes, or extended to act like a real networking gateway, or
+  include multiple services over one connection
+* Defensible - involves no new custom protocols or cryptography, just solid
+  implementations of existing ones fused together
+
 A `Context` owns one UDP socket, one WireGuard identity, one smoltcp TCP/IP
 stack, and any number of WireGuard peers. A single `TcpListener` accepts
 connections from all peers. Streams implement tokio's `AsyncRead` and
@@ -76,6 +91,24 @@ a context. The server example uses
 `with_peer_idle_timeout(Duration::from_secs(5))`; inactive peers are forgotten
 without stopping the listener or Context. Dropping an unfinalised context
 panics.
+
+## Crypto backend
+
+The default `crypto-rust` feature uses the smaller pure-Rust
+`nordisk-boringtun` backend:
+
+```text
+cargo build --profile production
+```
+
+To use Cloudflare BoringTun with `ring` instead:
+
+```text
+cargo build --no-default-features --features crypto-ring --profile production
+```
+
+The two crypto features are mutually exclusive. `crypto-rust` uses a
+third-party pure-Rust fork with the same public API and wire format.
 
 ## Examples
 

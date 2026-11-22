@@ -19,6 +19,14 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::task::{Context as TaskContext, Poll, Waker};
 use std::time::{Duration, Instant};
 
+#[cfg(all(feature = "crypto-ring", feature = "crypto-rust"))]
+compile_error!("enable only one of `crypto-ring` or `crypto-rust`");
+#[cfg(not(any(feature = "crypto-ring", feature = "crypto-rust")))]
+compile_error!("enable either `crypto-ring` or `crypto-rust`");
+
+#[cfg(feature = "crypto-rust")]
+use nordisk as boringtun;
+
 use boringtun::noise::handshake::parse_handshake_anon;
 use boringtun::noise::rate_limiter::RateLimiter;
 use boringtun::noise::{Packet, Tunn, TunnResult};
@@ -368,6 +376,7 @@ impl Context {
             return Ok(());
         }
 
+        let mut grace_elapsed = false;
         loop {
             let notified = self.inner.state_notify.notified();
             tokio::pin!(notified);
@@ -411,6 +420,11 @@ impl Context {
                 self.inner.request_driver();
             }
             if quiet && !timer_pending && !self.inner.transport_busy.load(Ordering::Acquire) {
+                if !grace_elapsed {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    grace_elapsed = true;
+                    continue;
+                }
                 self.inner.finish();
                 return Ok(());
             }
@@ -603,10 +617,12 @@ impl Stack {
     }
 
     fn add_socket(&mut self) -> SocketHandle {
-        self.sockets.add(tcp::Socket::new(
+        let mut socket = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0; TCP_BUFFER_SIZE]),
             tcp::SocketBuffer::new(vec![0; TCP_BUFFER_SIZE]),
-        ))
+        );
+        socket.set_ack_delay(None);
+        self.sockets.add(socket)
     }
 
     fn socket_mut(&mut self, handle: SocketHandle) -> &mut tcp::Socket<'static> {

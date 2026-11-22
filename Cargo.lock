@@ -373,6 +373,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "nordisk-boringtun"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd940acf9b8dd3c1fd0f45b603c7bdcb543dce133bdb78a939b90cc1e306bcbe"
+dependencies = [
+ "aead",
+ "base64",
+ "blake2",
+ "chacha20poly1305",
+ "hex",
+ "hmac",
+ "ip_network",
+ "ip_network_table",
+ "libc",
+ "nix",
+ "parking_lot",
+ "portable-atomic",
+ "rand_core",
+ "subtle",
+ "tracing",
+ "untrusted",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -723,6 +748,7 @@ name = "wg-tokio"
 version = "0.1.0"
 dependencies = [
  "boringtun",
+ "nordisk-boringtun",
  "smoltcp",
  "tokio",
 ]

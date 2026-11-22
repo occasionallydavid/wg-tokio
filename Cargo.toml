@@ -5,8 +5,14 @@ edition = "2024"
 description = "A small tokio::net-style TCP API over BoringTun and smoltcp"
 license = "MIT OR Apache-2.0"
 
+[features]
+default = ["crypto-rust"]
+crypto-ring = ["dep:boringtun"]
+crypto-rust = ["dep:nordisk"]
+
 [dependencies]
-boringtun = { version = "0.7.1", default-features = false }
+boringtun = { version = "0.7.1", default-features = false, optional = true }
+nordisk = { package = "nordisk-boringtun", version = "0.7.2", default-features = false, optional = true }
 smoltcp = { version = "0.14.0", default-features = false, features = [
     "medium-ip",
     "proto-ipv4",
