@@ -98,13 +98,13 @@ The default `crypto-rust` feature uses the smaller pure-Rust
 `nordisk-boringtun` backend:
 
 ```text
-cargo build --profile production
+cargo build
 ```
 
 To use Cloudflare BoringTun with `ring` instead:
 
 ```text
-cargo build --no-default-features --features crypto-ring --profile production
+cargo build --no-default-features --features crypto-ring
 ```
 
 The two crypto features are mutually exclusive. `crypto-rust` uses a

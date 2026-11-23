@@ -34,11 +34,3 @@ tokio = { version = "1.54.0", default-features = false, features = [
     "macros",
     "rt",
 ] }
-
-
-[profile.production]
-inherits = "release"
-codegen-units = 1
-opt-level = "z"  # Optimize for size.
-lto = "fat"
-strip = true  # Automatically strip symbols from the binary.
