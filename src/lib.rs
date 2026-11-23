@@ -74,6 +74,8 @@ pub struct ContextConfig {
     pub peer_verifier: Option<PeerVerifier>,
     /// Forget peers after this much authenticated inactivity.
     pub peer_idle_timeout: Option<Duration>,
+    /// Maximum handshake packets accepted in one rate-limit period.
+    pub handshake_rate_limit: u64,
 }
 
 impl ContextConfig {
@@ -85,6 +87,7 @@ impl ContextConfig {
             known_peers: Vec::new(),
             peer_verifier: None,
             peer_idle_timeout: None,
+            handshake_rate_limit: 100,
         }
     }
 
@@ -118,6 +121,13 @@ impl ContextConfig {
     #[must_use]
     pub fn with_peer_idle_timeout(mut self, peer_idle_timeout: Duration) -> Self {
         self.peer_idle_timeout = Some(peer_idle_timeout);
+        self
+    }
+
+    /// Sets the number of handshake packets accepted per rate-limit period.
+    #[must_use]
+    pub fn with_handshake_rate_limit(mut self, limit: u64) -> Self {
+        self.handshake_rate_limit = limit;
         self
     }
 }
@@ -189,7 +199,7 @@ impl Context {
         let udp = UdpSocket::bind(config.udp_bind).await?;
         let udp_addr = udp.local_addr()?;
         let local_public = PublicKey::from(&config.local_private_key);
-        let rate_limiter = Arc::new(RateLimiter::new(&local_public, 100));
+        let rate_limiter = Arc::new(RateLimiter::new(&local_public, config.handshake_rate_limit));
         let mut peers = HashMap::new();
         let mut routes = Vec::new();
 
@@ -1212,6 +1222,7 @@ async fn run_driver(
             result = udp.recv_from(&mut udp_buffer) => {
                 if let Ok((len, source)) = result {
                     let datagram = &udp_buffer[..len];
+                    rate_limiter.reset_count();
                     let parsed = match rate_limiter.verify_packet(
                         Some(source.ip()),
                         datagram,
@@ -1245,6 +1256,8 @@ async fn run_driver(
                     });
 
                     if let Some(peer_key) = target {
+                        let cookie_reply =
+                            matches!(parsed.as_ref(), Some(Packet::PacketCookieReply(_)));
                         let is_handshake_init =
                             matches!(parsed.as_ref(), Some(Packet::HandshakeInit(_)));
                         let allowed = if is_handshake_init {
@@ -1285,6 +1298,7 @@ async fn run_driver(
                                 peer,
                                 source.ip(),
                                 datagram,
+                                cookie_reply,
                                 &mut tunnel_buffer,
                                 &mut inbound,
                                 &mut outbound,
@@ -1399,15 +1413,18 @@ fn decapsulate_peer(
     peer: &mut PeerState,
     source: IpAddr,
     datagram: &[u8],
+    cookie_reply: bool,
     buffer: &mut [u8],
     inbound: &mut Vec<Vec<u8>>,
     outbound: &mut Vec<(SocketAddr, Vec<u8>)>,
 ) -> bool {
     let mut authenticated = false;
+    let mut cookie_accepted = false;
     let mut pending = Some(datagram);
 
     while let Some(datagram) = pending.take() {
         let result = peer.tunn.decapsulate(Some(source), datagram, buffer);
+        cookie_accepted |= cookie_reply && matches!(&result, TunnResult::Done);
         if matches!(
             &result,
             TunnResult::WriteToNetwork(_)
@@ -1420,6 +1437,10 @@ fn decapsulate_peer(
         } else {
             break;
         }
+    }
+    if cookie_accepted {
+        let result = peer.tunn.format_handshake_initiation(buffer, true);
+        handle_tunn_result(peer, result, inbound, outbound);
     }
     authenticated
 }
@@ -1484,4 +1505,55 @@ fn random_seed() -> u64 {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rate_limiter_resets_once_per_period() {
+        let client_private = StaticSecret::from([1; 32]);
+        let server_private = StaticSecret::from([2; 32]);
+        let server_public = PublicKey::from(&server_private);
+        let rate_limiter = RateLimiter::new(&server_public, 1);
+        let mut client = Tunn::new(client_private, server_public, None, None, 1, None);
+        let mut packet = [0_u8; MAX_UDP_DATAGRAM];
+        let TunnResult::WriteToNetwork(initiation) =
+            client.format_handshake_initiation(&mut packet, false)
+        else {
+            panic!("client did not produce a handshake initiation");
+        };
+        let mut cookie = [0_u8; 64];
+
+        assert!(
+            rate_limiter
+                .verify_packet(
+                    Some("127.0.0.1".parse().unwrap()),
+                    &*initiation,
+                    &mut cookie
+                )
+                .is_ok()
+        );
+        assert!(matches!(
+            rate_limiter.verify_packet(
+                Some("127.0.0.1".parse().unwrap()),
+                &*initiation,
+                &mut cookie
+            ),
+            Err(TunnResult::WriteToNetwork(_))
+        ));
+
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        rate_limiter.reset_count();
+        assert!(
+            rate_limiter
+                .verify_packet(
+                    Some("127.0.0.1".parse().unwrap()),
+                    &*initiation,
+                    &mut cookie
+                )
+                .is_ok()
+        );
+    }
 }

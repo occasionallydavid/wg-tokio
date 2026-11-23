@@ -1,4 +1,5 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wg_tokio::{AllowedIp, Context, ContextConfig, PublicKey, StaticSecret};
@@ -258,5 +259,84 @@ async fn peers_with_distinct_addresses_share_one_listener() {
     assert_eq!(peer_ips.len(), 2);
     assert!(peer_ips.contains(&client_a_ip));
     assert!(peer_ips.contains(&client_b_ip));
+    server.finalise().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cookie_reply_retries_handshake_immediately() {
+    let server_secret = StaticSecret::from([2; 32]);
+    let client_secret = StaticSecret::from([1; 32]);
+    let server_public = PublicKey::from(&server_secret);
+    let client_public = PublicKey::from(&client_secret);
+    let server_ip = IpAddr::V4(Ipv4Addr::new(10, 40, 0, 1));
+    let client_ip = IpAddr::V4(Ipv4Addr::new(10, 40, 0, 2));
+    let server_cidr: AllowedIp = "10.40.0.1/32".parse().unwrap();
+    let client_cidr: AllowedIp = "10.40.0.2/32".parse().unwrap();
+
+    let server = Context::new(
+        ContextConfig::new(
+            server_secret,
+            server_ip,
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .with_peer_verifier(
+            move |key| async move { (key == client_public).then(|| vec![client_cidr]) },
+        )
+        .with_handshake_rate_limit(0),
+    )
+    .await
+    .unwrap();
+    let listener = server.listen((server_ip, 8080)).await.unwrap();
+    let server_udp = server.udp_local_addr().unwrap();
+    let accept = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        stream.write_all(b"ok").await.unwrap();
+        stream.shutdown().await.unwrap();
+        stream
+    });
+
+    async fn connect_once(
+        client_secret: StaticSecret,
+        client_ip: IpAddr,
+        server_public: PublicKey,
+        server_udp: SocketAddr,
+        server_ip: IpAddr,
+        server_cidr: AllowedIp,
+    ) -> (Context, wg_tokio::TcpStream) {
+        let client = Context::new(
+            ContextConfig::new(
+                client_secret,
+                client_ip,
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+            )
+            .with_peer(server_public, server_udp)
+            .with_peer_verifier(move |key| async move {
+                (key == server_public).then(|| vec![server_cidr])
+            }),
+        )
+        .await
+        .unwrap();
+        let stream =
+            tokio::time::timeout(Duration::from_secs(2), client.connect((server_ip, 8080)))
+                .await
+                .expect("hidden cookie retry delayed the handshake")
+                .unwrap();
+        (client, stream)
+    }
+
+    let (client, stream) = connect_once(
+        client_secret,
+        client_ip,
+        server_public,
+        server_udp,
+        server_ip,
+        server_cidr,
+    )
+    .await;
+    let server_stream = accept.await.unwrap();
+    drop(stream);
+    drop(server_stream);
+    client.finalise().await.unwrap();
+
     server.finalise().await.unwrap();
 }
