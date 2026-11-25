@@ -24,25 +24,23 @@ compile_error!("enable only one of `crypto-ring` or `crypto-rust`");
 #[cfg(not(any(feature = "crypto-ring", feature = "crypto-rust")))]
 compile_error!("enable either `crypto-ring` or `crypto-rust`");
 
-#[cfg(feature = "crypto-rust")]
-use nordisk as boringtun;
-
 use boringtun::noise::handshake::parse_handshake_anon;
 use boringtun::noise::rate_limiter::RateLimiter;
 use boringtun::noise::{Packet, Tunn, TunnResult};
+pub use boringtun::x25519::{PublicKey, StaticSecret};
+#[cfg(feature = "crypto-rust")]
+use nordisk as boringtun;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium, PacketMeta};
+pub use smoltcp::socket::tcp::State as TcpState;
 use smoltcp::socket::{Socket, tcp};
 use smoltcp::time::Instant as SmolInstant;
+pub use smoltcp::wire::IpCidr as AllowedIp;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint};
 use tokio::io::{AsyncRead, AsyncWrite, Interest, ReadBuf, Ready};
 use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-
-pub use boringtun::x25519::{PublicKey, StaticSecret};
-pub use smoltcp::socket::tcp::State as TcpState;
-pub use smoltcp::wire::IpCidr as AllowedIp;
 
 pub type PeerVerifierFuture =
     Pin<Box<dyn Future<Output = Option<Vec<AllowedIp>>> + Send + 'static>>;
@@ -52,6 +50,9 @@ const MTU: usize = 1420;
 const TCP_BUFFER_SIZE: usize = 64 * 1024;
 const MAX_UDP_DATAGRAM: usize = 65_535;
 const DRIVER_SLICE: Duration = Duration::from_secs(1);
+const FINALISE_FLUSH_TIMEOUT: Duration = Duration::from_millis(100);
+const MAX_RX_BATCH: usize = 64;
+const ACK_DELAY: Duration = Duration::from_millis(2);
 const LISTENER_BACKLOG: usize = 32;
 
 #[derive(Clone, Copy)]
@@ -377,7 +378,7 @@ impl Context {
         })
     }
 
-    /// Close every TCP socket gracefully and wait for final acknowledgements.
+    /// Queue close packets, flush them, and stop the context.
     ///
     /// A context must be finalised explicitly or by its configured idle timeout
     /// before it is dropped.
@@ -386,13 +387,13 @@ impl Context {
             return Ok(());
         }
 
-        let mut grace_elapsed = false;
+        let deadline = Instant::now() + FINALISE_FLUSH_TIMEOUT;
         loop {
             let notified = self.inner.state_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            let (quiet, emitted, timer_pending) = {
+            let (quiet, emitted) = {
                 let mut stack = lock(&self.inner.stack);
                 let handles: Vec<_> = stack.sockets.iter().map(|(handle, _)| handle).collect();
 
@@ -412,34 +413,33 @@ impl Context {
                 }
 
                 let emitted = stack.poll_interface();
-                let quiet = stack.sockets.iter().all(|(_, socket)| match socket {
-                    Socket::Tcp(socket) => {
-                        matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait)
-                    }
-                });
                 let tx_pending = !stack.device.tx.is_empty();
-                let Stack { iface, sockets, .. } = &mut *stack;
-                let timer_pending = iface
-                    .poll_delay(SmolInstant::now(), sockets)
-                    .is_some_and(|delay| delay.total_millis() < 1_000);
-
-                (quiet && !tx_pending, emitted, timer_pending)
+                (!tx_pending, emitted)
             };
 
-            if emitted || timer_pending {
+            if emitted {
                 self.inner.request_driver();
             }
-            if quiet && !timer_pending && !self.inner.transport_busy.load(Ordering::Acquire) {
-                if !grace_elapsed {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                    grace_elapsed = true;
-                    continue;
-                }
+            if quiet && !self.inner.transport_busy.load(Ordering::Acquire) {
                 self.inner.finish();
                 return Ok(());
             }
 
-            notified.await;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let mut stack = lock(&self.inner.stack);
+                let handles: Vec<_> = stack.sockets.iter().map(|(handle, _)| handle).collect();
+                for handle in handles {
+                    stack.socket_mut(handle).abort();
+                }
+                drop(stack);
+                self.inner.finish();
+                return Ok(());
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep(remaining) => {}
+            }
         }
     }
 }
@@ -631,7 +631,7 @@ impl Stack {
             tcp::SocketBuffer::new(vec![0; TCP_BUFFER_SIZE]),
             tcp::SocketBuffer::new(vec![0; TCP_BUFFER_SIZE]),
         );
-        socket.set_ack_delay(None);
+        socket.set_ack_delay(Some(ACK_DELAY.into()));
         self.sockets.add(socket)
     }
 
@@ -1220,89 +1220,31 @@ async fn run_driver(
             _ = notified => {}
             _ = tokio::time::sleep(delay) => {}
             result = udp.recv_from(&mut udp_buffer) => {
-                if let Ok((len, source)) = result {
-                    let datagram = &udp_buffer[..len];
-                    rate_limiter.reset_count();
-                    let parsed = match rate_limiter.verify_packet(
-                        Some(source.ip()),
-                        datagram,
-                        &mut cookie_buffer,
-                    ) {
-                        Ok(packet) => Some(packet),
-                        Err(TunnResult::WriteToNetwork(cookie)) => {
-                            outbound.push((source, cookie.to_vec()));
-                            None
-                        }
-                        Err(_) => None,
-                    };
-
-                    let target = parsed.as_ref().and_then(|packet| match packet {
-                        Packet::HandshakeInit(init) => parse_handshake_anon(
+                if let Ok((mut len, mut source)) = result {
+                    for _ in 0..MAX_RX_BATCH {
+                        process_datagram(
+                            &inner,
                             &local_private,
                             &local_public,
-                            init,
+                            &verifier,
+                            &rate_limiter,
+                            &mut peers,
+                            &mut next_index,
+                            &udp_buffer[..len],
+                            source,
+                            &mut cookie_buffer,
+                            &mut tunnel_buffer,
+                            &mut inbound,
+                            &mut outbound,
                         )
-                        .ok()
-                        .map(|handshake| PublicKey::from(handshake.peer_static_public)),
-                        Packet::HandshakeResponse(packet) => {
-                            peer_key_by_index(&peers, packet.receiver_idx)
-                        }
-                        Packet::PacketCookieReply(packet) => {
-                            peer_key_by_index(&peers, packet.receiver_idx)
-                        }
-                        Packet::PacketData(packet) => {
-                            peer_key_by_index(&peers, packet.receiver_idx)
-                        }
-                    });
-
-                    if let Some(peer_key) = target {
-                        let cookie_reply =
-                            matches!(parsed.as_ref(), Some(Packet::PacketCookieReply(_)));
-                        let is_handshake_init =
-                            matches!(parsed.as_ref(), Some(Packet::HandshakeInit(_)));
-                        let allowed = if is_handshake_init {
-                            match &verifier {
-                                Some(verifier) => verifier(peer_key).await,
-                                None => peers.get(&peer_key).map(|peer| peer.allowed.clone()),
+                        .await;
+                        match udp.try_recv_from(&mut udp_buffer) {
+                            Ok((next_len, next_source)) => {
+                                len = next_len;
+                                source = next_source;
                             }
-                        } else {
-                            peers.get(&peer_key).map(|peer| peer.allowed.clone())
-                        };
-
-                        if let Some(allowed) = allowed {
-                            let peer = peers.entry(peer_key).or_insert_with(|| {
-                                let index = next_index;
-                                next_index += 1;
-                                let tunn = Tunn::new(
-                                    local_private.clone(),
-                                    peer_key,
-                                    None,
-                                    None,
-                                    index,
-                                    Some(Arc::clone(&rate_limiter)),
-                                );
-                                PeerState {
-                                    public_key: peer_key,
-                                    endpoint: source,
-                                    allowed: allowed.clone(),
-                                    tunn,
-                                    last_activity: Instant::now(),
-                                    index,
-                                }
-                            });
-                            peer.endpoint = source;
-                            peer.allowed = allowed.clone();
-                            peer.last_activity = Instant::now();
-                            inner.set_peer_routes(peer_key, allowed);
-                            decapsulate_peer(
-                                peer,
-                                source.ip(),
-                                datagram,
-                                cookie_reply,
-                                &mut tunnel_buffer,
-                                &mut inbound,
-                                &mut outbound,
-                            );
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                            Err(_) => break,
                         }
                     }
                 }
@@ -1377,6 +1319,95 @@ async fn run_driver(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn process_datagram(
+    inner: &Arc<Inner>,
+    local_private: &StaticSecret,
+    local_public: &PublicKey,
+    verifier: &Option<PeerVerifier>,
+    rate_limiter: &Arc<RateLimiter>,
+    peers: &mut HashMap<PublicKey, PeerState>,
+    next_index: &mut u32,
+    datagram: &[u8],
+    source: SocketAddr,
+    cookie_buffer: &mut [u8; 64],
+    tunnel_buffer: &mut [u8],
+    inbound: &mut Vec<Vec<u8>>,
+    outbound: &mut Vec<(SocketAddr, Vec<u8>)>,
+) {
+    rate_limiter.reset_count();
+    let parsed = match rate_limiter.verify_packet(Some(source.ip()), datagram, cookie_buffer) {
+        Ok(packet) => Some(packet),
+        Err(TunnResult::WriteToNetwork(cookie)) => {
+            outbound.push((source, cookie.to_vec()));
+            None
+        }
+        Err(_) => None,
+    };
+
+    let target = parsed.as_ref().and_then(|packet| match packet {
+        Packet::HandshakeInit(init) => parse_handshake_anon(local_private, local_public, init)
+            .ok()
+            .map(|handshake| PublicKey::from(handshake.peer_static_public)),
+        Packet::HandshakeResponse(packet) => peer_key_by_index(peers, packet.receiver_idx),
+        Packet::PacketCookieReply(packet) => peer_key_by_index(peers, packet.receiver_idx),
+        Packet::PacketData(packet) => peer_key_by_index(peers, packet.receiver_idx),
+    });
+
+    let Some(peer_key) = target else {
+        return;
+    };
+    let cookie_reply = matches!(parsed.as_ref(), Some(Packet::PacketCookieReply(_)));
+    let is_handshake_init = matches!(parsed.as_ref(), Some(Packet::HandshakeInit(_)));
+    let allowed = if is_handshake_init {
+        match verifier {
+            Some(verifier) => verifier(peer_key).await,
+            None => peers.get(&peer_key).map(|peer| peer.allowed.clone()),
+        }
+    } else {
+        peers.get(&peer_key).map(|peer| peer.allowed.clone())
+    };
+
+    let Some(allowed) = allowed else {
+        return;
+    };
+    let peer = peers.entry(peer_key).or_insert_with(|| {
+        let index = *next_index;
+        *next_index += 1;
+        let tunn = Tunn::new(
+            local_private.clone(),
+            peer_key,
+            None,
+            None,
+            index,
+            Some(Arc::clone(rate_limiter)),
+        );
+        PeerState {
+            public_key: peer_key,
+            endpoint: source,
+            allowed: allowed.clone(),
+            tunn,
+            last_activity: Instant::now(),
+            index,
+        }
+    });
+    peer.endpoint = source;
+    peer.allowed = allowed.clone();
+    inner.set_peer_routes(peer_key, allowed);
+    let authenticated = decapsulate_peer(
+        peer,
+        source.ip(),
+        datagram,
+        cookie_reply,
+        tunnel_buffer,
+        inbound,
+        outbound,
+    );
+    if authenticated {
+        peer.last_activity = Instant::now();
+    }
+}
+
 fn peer_key_by_index(
     peers: &HashMap<PublicKey, PeerState>,
     receiver_idx: u32,
@@ -1442,7 +1473,7 @@ fn decapsulate_peer(
         let result = peer.tunn.format_handshake_initiation(buffer, true);
         handle_tunn_result(peer, result, inbound, outbound);
     }
-    authenticated
+    authenticated || cookie_accepted
 }
 
 fn handle_tunn_result(

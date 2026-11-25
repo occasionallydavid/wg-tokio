@@ -340,3 +340,58 @@ async fn cookie_reply_retries_handshake_immediately() {
 
     server.finalise().await.unwrap();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn expired_peer_aborts_its_tcp_sessions() {
+    let server_secret = StaticSecret::from([2; 32]);
+    let client_secret = StaticSecret::from([1; 32]);
+    let server_public = PublicKey::from(&server_secret);
+    let client_public = PublicKey::from(&client_secret);
+    let server_ip = IpAddr::V4(Ipv4Addr::new(10, 50, 0, 1));
+    let client_ip = IpAddr::V4(Ipv4Addr::new(10, 50, 0, 2));
+    let server_cidr: AllowedIp = "10.50.0.1/32".parse().unwrap();
+    let client_cidr: AllowedIp = "10.50.0.2/32".parse().unwrap();
+
+    let server = Context::new(
+        ContextConfig::new(
+            server_secret,
+            server_ip,
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .with_peer_verifier(
+            move |key| async move { (key == client_public).then(|| vec![client_cidr]) },
+        )
+        .with_peer_idle_timeout(Duration::from_millis(100)),
+    )
+    .await
+    .unwrap();
+    let listener = server.listen((server_ip, 8080)).await.unwrap();
+    let server_udp = server.udp_local_addr().unwrap();
+    let client = Context::new(
+        ContextConfig::new(
+            client_secret,
+            client_ip,
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .with_peer(server_public, server_udp)
+        .with_peer_verifier(move |key| async move {
+            (key == server_public).then(|| vec![server_cidr])
+        }),
+    )
+    .await
+    .unwrap();
+
+    let client_stream =
+        tokio::time::timeout(Duration::from_secs(2), client.connect((server_ip, 8080)))
+            .await
+            .unwrap()
+            .unwrap();
+    let (server_stream, _) = listener.accept().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(server_stream.state(), wg_tokio::TcpState::Closed);
+
+    drop(server_stream);
+    drop(client_stream);
+    client.finalise().await.unwrap();
+    server.finalise().await.unwrap();
+}
